@@ -1,0 +1,14 @@
+venv/
+.venv/
+env/
+
+__pycache__/
+*.pyc
+
+.env
+.env.local
+
+.DS_Store
+
+meu_relatorio.txt
+chroma_db/
