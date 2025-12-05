@@ -1,147 +1,172 @@
 import os
+import requests
+import traceback
+import math
 from typing import List
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends
 from pydantic import BaseModel
+from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
+from sqlalchemy import create_engine, text
+from sqlalchemy.orm import sessionmaker
 
-import google.generativeai as genai
-from langchain_google_genai import GoogleGenerativeAIEmbeddings
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_community.vectorstores import Chroma
-from langchain.prompts import PromptTemplate
-from langchain.schema.runnable import RunnablePassthrough
-from langchain.schema.output_parser import StrOutputParser
-from langchain_community.document_loaders import TextLoader
-from langchain.text_splitter import RecursiveCharacterTextSplitter
 
-app = FastAPI(
-    title="API RAG Project Solaris/TechShield",
-    description="API para consulta de documentos usando Google Gemini e LangChain",
-    version="1.0.0"
-)
+DATABASE_URL = ""
+
+engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+app = FastAPI(title="API Agente (SQL + FAQ Dinâmico)", version="2.0.0")
 
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+URL_MEMORIA = "http://127.0.0.1:8000/buscar_contexto"
 
-if not GOOGLE_API_KEY:
-    print("AVISO: A variável de ambiente GOOGLE_API_KEY não foi encontrada.")
+embeddings_model = None
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+def calcular_similaridade(vec1, vec2):
+    dot_product = sum(a * b for a, b in zip(vec1, vec2))
+    norm_a = math.sqrt(sum(a * a for a in vec1))
+    norm_b = math.sqrt(sum(b * b for b in vec2))
+    if norm_a == 0 or norm_b == 0:
+        return 0.0
+    return dot_product / (norm_a * norm_b)
 
 class QuestionRequest(BaseModel):
+    bot_id: int
     question: str
-
-class AnswerResponse(BaseModel):
-    question: str
-    answer: str
-    source_documents: List[str] = [] 
-
-rag_chain = None
-retriever_global = None
 
 @app.on_event("startup")
 async def startup_event():
-    global rag_chain, retriever_global
-    
-    print("Inicializando a base de conhecimento...")
-
-    conteudo_do_txt = """
-RELATÓRIO DE SEGURANÇA CIBERNÉTICA 2025
-Empresa: TechShield Solutions
-Autor: João Silva
-
-1. INTRODUÇÃO
-Este documento detalha as novas políticas de senha da TechShield.
-A partir de Março de 2025, todas as senhas devem ter 16 caracteres.
-O uso de autenticação de dois fatores (2FA) é obrigatório para todos os diretores.
-
-2. INCIDENTES RECENTES
-No mês passado, bloqueamos 450 tentativas de phishing vindas de IPs externos.
-O servidor 'Alpha-1' foi atualizado para evitar a vulnerabilidade 'Log4Shell'.
-
-3. ORÇAMENTO DE T.I.
-Foi aprovada a compra de 50 novos Macbooks para a equipe de desenvolvimento.
-O custo total foi de R$ 750.000,00.
-"""
-    filename = "meu_relatorio.txt"
-    with open(filename, "w", encoding="utf-8") as f:
-        f.write(conteudo_do_txt)
-
-    loader = TextLoader(filename, encoding="utf-8")
-    documento_bruto = loader.load()
-    
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=500,
-        chunk_overlap=50
-    )
-    docs_processados = splitter.split_documents(documento_bruto)
-
-
+    global embeddings_model
+    print("--- INICIANDO AGENTE ---")
     if GOOGLE_API_KEY:
-        embeddings = GoogleGenerativeAIEmbeddings(
-            model="models/embedding-001", 
-            google_api_key=GOOGLE_API_KEY
-        )
+        try:
+            embeddings_model = GoogleGenerativeAIEmbeddings(
+                model="models/embedding-001", 
+                google_api_key=GOOGLE_API_KEY
+            )
+            print("Modelo de Embeddings pronto.")
+        except Exception as e:
+            print(f"Erro ao carregar modelo de embeddings: {e}")
+
+@app.post("/perguntar")
+async def ask_question(request: QuestionRequest, db=Depends(get_db)):
+    
+    print(f"\n--- Nova Pergunta (Bot ID {request.bot_id}): {request.question} ---")
+    
+    query_bot = text("""
+        SELECT c.name, k.kb_id
+        FROM chatbots c
+        LEFT JOIN chatbot_kb k ON c.id = k.bot_id
+        WHERE c.id = :bid
+    """)
+    
+    query_faq = text("SELECT question FROM chatbot_faqs WHERE bot_id = :bid")
+
+    try:
+        result_bot = db.execute(query_bot, {"bid": request.bot_id}).fetchone()
+        if not result_bot:
+            raise HTTPException(status_code=404, detail="Bot não encontrado")
         
-        vector = Chroma.from_documents(
-            documents=docs_processados,
-            embedding=embeddings,
-            collection_name="database1",
-            collection_metadata={"teste": "testado", "cor":"azul"},
-        )
+        bot_name = result_bot[0]
+        kb_collection_name = result_bot[1]
+        
+        result_faqs = db.execute(query_faq, {"bid": request.bot_id}).fetchall()
+        lista_faq_sql = [row[0] for row in result_faqs] 
+        
+        print(f"Bot: {bot_name} | Memória: {kb_collection_name} | FAQs Carregados: {len(lista_faq_sql)}")
 
-        retriever_global = vector.as_retriever(
-            search_type="similarity",
-            search_kwargs={"k": 2}
-        )
+    except Exception as e:
+        print(f"Erro SQL: {e}")
+        raise HTTPException(status_code=500, detail="Erro interno no Banco de Dados")
 
+    is_faq_match = False
+    
+   
+    if embeddings_model and lista_faq_sql:
+        try:
+            user_vector = embeddings_model.embed_query(request.question)
+            
+           
+            faq_vectors = embeddings_model.embed_documents(lista_faq_sql)
+            
+            
+            maior_similaridade = 0
+            pergunta_mais_parecida = ""
+            
+            for i, faq_vec in enumerate(faq_vectors):
+                score = calcular_similaridade(user_vector, faq_vec)
+                if score > maior_similaridade:
+                    maior_similaridade = score
+                    pergunta_mais_parecida = lista_faq_sql[i]
+            
+            print(f"Maior similaridade: {maior_similaridade:.2f} com '{pergunta_mais_parecida}'")
+
+            if maior_similaridade > 0.88:
+                print(">>> FAQ DETECTADO! <<<")
+                is_faq_match = True
+                
+        except Exception as e:
+            print(f"Erro na verificação de FAQ: {e}")
+
+ 
+    contextos_texto = ""
+    if kb_collection_name:
+        payload_memoria = {
+            "query": request.question, 
+            "collection_name": kb_collection_name,
+            "k": 3
+        }
+        try:
+            resp = requests.post(URL_MEMORIA, json=payload_memoria)
+            if resp.status_code == 200:
+                lista = resp.json().get("contextos", [])
+                contextos_texto = "\n---\n".join(lista)
+        except Exception as e:
+            print(f"Erro conexão memória: {e}")
+
+    try:
+       
+        temp = 0.1 if is_faq_match else 0.4 
+        
         llm = ChatGoogleGenerativeAI(
             model="gemini-2.5-flash",
-            temperature=0.1,
+            temperature=temp,
             google_api_key=GOOGLE_API_KEY
         )
 
-        template = """
-        Você é um assistente especialista no projeto Solaris e TechShield.
-        Use APENAS o contexto fornecido abaixo para responder à pergunta.
-        Se a resposta não estiver no contexto, diga que não sabe. Não invente informações.
-
-        Contexto Recuperado:
-        {context}
-
-        Pergunta do Usuário:
-        {question}
-
-        Resposta Otimizada:
-        """
-        prompt = PromptTemplate.from_template(template)
-
-        def format_docs(docs):
-            return "\n\n".join(doc.page_content for doc in docs)
-
-        rag_chain = (
-            {"context": retriever_global | format_docs, "question": RunnablePassthrough()}
-            | prompt
-            | llm
-            | StrOutputParser()
-        )
-        print("Sistema RAG inicializado com sucesso!")
-    else:
-        print("ERRO: API Key não configurada. O sistema não funcionará corretamente.")
-
-
-@app.get("/")
-def read_root():
-    return {"status": "online", "message": "Bem-vindo à API RAG Solaris/TechShield"}
-
-@app.post("/perguntar", response_model=AnswerResponse)
-async def ask_question(request: QuestionRequest):
-    if not rag_chain:
-        raise HTTPException(status_code=500, detail="O sistema RAG não foi inicializado (verifique a API Key).")
     
-    try:
-        resposta = rag_chain.invoke(request.question)
+        instrucao_faq = ""
+        if is_faq_match:
+            instrucao_faq = "ATENÇÃO: O usuário fez uma pergunta identificada como frequente (FAQ). Use o contexto abaixo para responder de forma direta e precisa."
+
+        prompt_final = f"""
+        Você é o assistente virtual {bot_name}.
+        {instrucao_faq}
         
-        return AnswerResponse(
-            question=request.question,
-            answer=resposta
-        )
+        CONTEXTO DE CONHECIMENTO:
+        {contextos_texto}
+        
+        PERGUNTA DO USUÁRIO: {request.question}
+        """
+        
+        response = llm.invoke(prompt_final)
+        
+        return {
+            "bot_name": bot_name,
+            "answer": response.content,
+            "is_faq": is_faq_match,
+            "similaridade": f"{maior_similaridade:.2f}" if 'maior_similaridade' in locals() else "0"
+        }
+
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Erro ao processar a pergunta: {str(e)}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail="Erro na geração da IA")

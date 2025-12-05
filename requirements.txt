@@ -1,8 +1,9 @@
 fastapi
 uvicorn
-google-generativeai
-langchain
+python-multipart
+requests
 langchain-google-genai
+langchain-chroma
 langchain-community
 chromadb
 pydantic
